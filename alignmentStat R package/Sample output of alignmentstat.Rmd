@@ -1,0 +1,51 @@
+---
+title: "Sample output of alignment.stat"
+author: "Paul Rognon"
+date: "18/11/2019"
+output: html_document
+params:
+  sequence1: gi32141095_N_1.fa
+  sequence2: gi32141095_N_0.fa
+  path: ~/MESIO/Bioinformatica/Task 1&2
+  type: "DNA"
+  alignment: "local"
+  matrix: "BLOSUM50"
+  opening_penal: -5
+  ext_penal: -1
+  times_shuffling: 1000
+  seq_shuffled: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+### Summary of inputs:
+ * sequence 1: `r params$sequence1`
+ * sequence 2: `r params$sequence2`
+ * sequence type: `r params$type`
+ * alignment type: `r params$alignment`
+ * substitution matrix: `r params$matrix`
+ * gap opening penalty: `r params$opening_penal`
+ * gap extension penalty: `r params$ext_penal`
+ * number of shuffling times: `r params$times_shuffling`
+ * shuffled sequence: `r params$seq_shuffled`
+ 
+### Results
+The output is composed of: a summary of the scores distribution obtained by shuffling, the parameters of the Gumbel distribution, the alignment score, standardized score and p-value.
+
+```{r}
+path=params$path
+  
+as<-alignment.stat(
+  sequence1=paste(path,params$sequence1,sep="/"),
+  sequence2=paste(path,params$sequence2,sep="/"),
+  type_seq=params$type,
+  alignment=params$alignment,
+  submatrix=params$matrix,
+  gapOpenPenal=params$opening_penal,
+  gapExtPenal=params$ext_penal,
+  N=params$times_shuffling,
+  shuffled=params$seq_shuffled)
+```
+
