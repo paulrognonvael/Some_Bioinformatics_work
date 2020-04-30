@@ -1,0 +1,839 @@
+---
+title: "Bioinformatics - Final Assignment"
+author: "Paul Rognon - Class 2019-2020"
+date: "10/01/2020"
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{makecell}
+output: 
+  pdf_document:
+    number_sections: TRUE
+    toc: TRUE
+editor_options:
+  chunk_output_type: console
+params:
+  path: ""
+  wig: ""
+  gff: ""
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+```
+
+\pagebreak
+
+# Introduction and objectives
+
+In this document, we replicate the work done by DeJesus et Iorger in [1]. They propose a Hidden Markov Model (HMM) for identifying essential regions in bacterial genome from sequencing data obtained by transposon insertion. They evaluate the performance of the model on a sequence dataset of the H37Rv strain of *M.Tuberculosis* (Mtb) transposon mutants constructed by Griffin et al. [2].
+
+# Background
+
+Transposon mutagenesis is an experimental method in which genes are transferred to a host organism's chromosome, interrupting or modifying the function of an existent gene and causing mutation. The method relies on the ability of transposons, semi-parasitic DNA sequences, to replicate and spread through the host's genome. For example, in our case, Griffin et al. generated $10^5$ independent insertion events in the H37Rv genome composed of one chromosome, using a modified Himar1 based transposon. The Himar1 transposon inserts randomly into TA dinucleotide sites. The resulting modified genome is called the library of transposon mutants. Griffin et al. then grew replicates of this library for 12 generations. The authors then used Illumina deep sequencing to obtain the sequence of transposon insertions mutants. Deep sequencing consists in sequencing a genomic region multiple times and it enabled the authors of [2] to map in the genome of H37Rv the TA sites that withstood transposon insertions and those that did not.
+
+Transposon mutagenesis is useful to find essential regions in genome because the mutations on genes essential for the organism growth can prove to be lethal. Therefore, mutant genes that are required for growth or survival should be absent or significantly under‐represented in the grown population. On the contrary, mutant genes that survived after insertion are very probably non-essential. The absence or presence of an insertion in a site and the number of reads in the sequencing are then good indicators of the essentiality of region.
+
+On one hand, some methods are based on the presence or absence of insertion. They identify essentiality from the probability that a gene lacking insertions is essential that can be modelled with a Binomial, negative-Binomial or Extreme Value distribution. However, those methods are highly sensitive to spurious reads, such as isolated reads that translate to spurious non-essential region. On the other hand, methods are based on read counts as it reflects the abundance of certain clones in the library and hence the degree to which a region of the genome is essential. Those methods are susceptible to spikes in the data, where there is a massive over-representation of reads at an isolated site, that greatly influence statistics. Both types of approach then lack flexibility and robustness.
+
+The DeJesus et Iorger design a HMM that incorporates information from read counts at individual TA sites. The proposed HMM performs a smoothing that can accommodate such abrupt changes that disrupt afore mentioned methods. Indeed, it is a sequence-dependent model as it predicts the essentiality from the conditional probability of a state conditioned on the previous neighbouring site. By coupling neighbouring sites together, it is able to disambiguate the interpretation of each site. TA sites with no insertion in non-essential regions (e.g. because the insertion process missed the site during the construction of the library) are tolerated because neighbouring sites have insertions.
+
+
+```{r, include=FALSE}
+# libraries
+
+library(kableExtra)
+library(ggplot2)
+library(tidyverse)
+library(rtracklayer)
+library(readxl)
+
+# function to format printed numbers
+formatgraph <- function(x) {
+  formatC(x, format = "e", digits = 3)
+}
+
+
+# function to write matrix in markdown
+write_matex2 <- function(x) {
+  x <- as.matrix(x)
+  begin <- "\\begin{bmatrix}"
+  end <- "\\end{bmatrix}"
+  X <-
+    apply(x, 1, function(x) {
+      paste(
+        paste(x, collapse = "&"),
+        "\\\\"
+      )
+    })
+  paste(c(begin, X, end), collapse = "")
+}
+```
+
+# Data
+
+As explained before the data used in this work is a sequence dataset of **M.Tuberculosis** (Mtb) transposon mutants constructed by Griffin et al. [2]. We obtained the data from the project home page referenced in the original article [1]. The dataset is a WIG file composed of two columns: the column "variableStep" indicating the location (TA site) in the genome and the variable "count" that gives the number of read counts at that TA site. DeJesus et Iorger mention 74,605 TA sites in [1] but the provided dataset has only 73,385 sites. Table \ref{tab:tab1} contains a sample of the data.
+
+
+```{r}
+# Read the data
+data <- read_table2(paste0(params$path, params$wig), col_names = FALSE, skip = 1)
+colnames(data) <- c("variableStep", "count")
+```
+
+
+```{r,include=TRUE}
+# print sample data
+set.seed(426)
+data %>%
+  sample_n(10) %>%
+  kable("latex",
+    booktabs = T,
+    caption = "\\label{tab:tab1} Sample of data"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+# HMM model
+
+In addition to the two obvious states, essential (ES) and non-essential (NE). DeJesus et Iorger define two extra states:
+
+* growth-defect (GD), for regions that are not essential but whose disruption leads to impaired growth of the organism, they have low number of read counts.
+* growth-advantage (GA), regions that are not essential but also could have a metabolic cost such that their disruption is advantageous for growth in vitro. They have a very high number of read counts.
+
+According to the authors, the addition of these two states to the HMM allows it to distinguish regions in the sequence data with depressed or unusually high read counts in a statistically rigorous way.
+
+```{r}
+# States
+states <- c("ES", "GD", "NE", "GA")
+N <- length(states)
+```
+
+## Emission probabilities
+
+```{r}
+### Estimation of HMM model emission function and transition matrix
+
+# Estimation of geometric distribution parameters for emission probabilities
+reads <- data$count
+reads_nz <- sort(reads[reads != 0 ])
+size <- length(reads_nz)
+mean_r <- mean(reads_nz[1:round(0.95 * size)])
+
+mu <- c(1 / 0.99, 0.01 * mean_r + 2, mean_r, mean_r * 5.0)
+L <- 1.0 / mu
+
+fun1 <- function(i) {
+  fun2 <- function(x) {
+    dgeom(x, prob = L[i])
+  }
+  return(fun2)
+}
+
+
+B <- vector("list", 4)
+
+for (i in 1:N) {
+  B[[i]] <- fun1(i)
+}
+```
+
+DeJesus et Iorger first define the emission probabilities. They chose a geometric distribution to model the read counts with each state having a different parameter $\theta$. The geometric distribution is a discrete distribution such that: 
+
+$$P(C_i=c_i|l)=(1-\theta_l)^{c_i}\theta_l $$
+where $c_i$ is the count and $l$ is the state in TA site $i$. $\theta$ takes values between 0 and 1, the larger $\theta$ the higher the probability of a 0 count. $\theta$ can be understood as the Bernoulli probability of an insertion. The maximum likelihood estimator for $\theta$ is $\frac{1}{\bar{c}}$ where $\bar{c}$ is the average read count at non-empty read counts. Therefore, for the non-essential state $\theta$ is set at $\frac{1}{\bar{c}}$. For the essential state, the authors set $\theta=0.99$ making 0 count highly probable but allowing for 1-2 read counts. For the growth-defect state, $\theta$ is set at $\theta = 1/(0.01 \bar{c} + 2)$ reflecting the fact that the growth-defect state must represent approximately 100 times lower read counts than the non-essential state. For the growth-advantage state, $\theta$ is set to the inverse of five times the mean read count $\frac{1}{5\bar{c}}$ to capture sites with significantly more insertions locally than what is observed on average in the genome. Table \ref{tab:tab2} shows the $\hat{\theta}$ for each state. In the estimation of $\bar{c}$, the authors exclude the largest 5% for robustness. Just like DeJesus et Iorger, we obtain $\bar{c}=$ `r round(mean_r)`.
+
+```{r,include=TRUE}
+# print sample data
+
+df <- data.frame(states, formatgraph(L))
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab2} Emission distribution parameters",
+  col.names = c("State", "$\\theta$"), escape = FALSE
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+## Transition matrix
+
+DeJesus et Iorger then define a transmission matrix T that is symmetric for simplicity. They note the transmission matrix determines the degree of "smoothing" in the boundaries of essential and non-essential regions. According to the authors the probability of self-transition should be nearly 1 for all states, the probability of transitioning from one state to another nearly 0. This ensures that a significant change in read-counts is required to justify a transition and as well as smoothing over spurious reads. They make the transition matrix depend on the expected minimum length of essential regions. The length of such regions is modelled by a geometric distribution again. Indeed the geometric distribution models the number of failures before the first success. If we define an insertion as the success event, a variable following a geometric distribution with parameter the probability of an insertion will count the number of sites without insertion until the first insertion occurs.
+
+```{r}
+# Estimation of the transition matrix
+calculate_pins <- function(O) {
+  non_ess_reads <- c()
+  temp <- c()
+  for (rd in O) {
+    if (rd >= 1) {
+      if (length(temp) < 10) {
+        non_ess_reads <- c(non_ess_reads, temp)
+      }
+      non_ess_reads <- c(non_ess_reads, rd)
+      temp <- c()
+    } else {
+      temp <- c(temp, rd)
+    }
+  }
+  return(sum(non_ess_reads >= 1) / length(non_ess_reads))
+}
+
+pins <- calculate_pins(reads)
+```
+If the entire dataset is used to estimate the probability of insertion, $p_{ins}$, the sample will include essential regions with insertion probabilities which are not representative of non-essential regions. To alleviate this bias, the authors suggest discarding regions with 10 or more TA sites in a row lacking insertions. The probability is then calculated as the insertion density in the remaining areas. We obtain a probability of insertion of $p_{ins}=$ `r round(pins,3)`.
+
+```{r}
+pnon <- 1.0 - pins
+
+for (r in 0:100) {
+  if ((pnon**r) < 0.01) {
+    break
+  }
+
+  A <- matrix(nrow = N, ncol = N)
+  a <- log1p(-(B[[3]](0)**r))
+  # b <- log((1-exp(a))/3)
+  b <- (r * log(B[[3]](0))) + log(1.0 / 3)
+  for (i in 1:4) {
+    A[i, ] <- rep(b, N)
+    A[i, i] <- a
+  }
+}
+```
+
+Once the insertion probability is estimated, the minimum length of essential regions, $r^*$, is taken to be
+the smallest integer such that the probability of $r^*$ failures, that $r^*$ no insertions, is less than 0.01:
+
+$$(1-p_{ins})^{r^*}<0.01$$
+We obtain $r^*=$ `r r` TA sites.
+
+The probability of self-transitioning, remaining in the same state, is finally as taken as:
+
+$$T_{ll}=1-P(C=0|NE)^{r^*}$$
+DeJesus et Iorger justify this calibration by a rationale that we could rephrase as follows. We part from the most common state: non-essential. Indeed previous studies [3] showed that only 15% of the genes in the genome of prokaryotic organisms are essential. Then if in a non-essential state, we observe 0 read-counts $r^*$ times, the expected minimum length of essential regions, the model should switch to the essential state. Therefore the probability of remaining in non-essential state is taken as 1 minus the probability of such event. The same probability of self-transitioning is used for all states. As we have the diagonal defined, the rest of the matrix is set such that the matrix is symmetric and rows sum 1.
+
+We obtain the following matrix:
+$$\log{T} = `r write_matex2(formatgraph(A))`$$
+
+## Algorithm
+
+We use, as done by original authors, the Viterbi algorithm to estimate the most probable state. The algorithm requires the multiplication of small probabilities numerous times so, to overcome underflow issues, the computation are carried out in a logarithmic scale. DeJesus et Iorger set initial probabilities as follows in Table \ref{tab:tab3} without discussing this choice. The initial probabilities have no impact on the most probable path in HMM. In Table \ref{tab:tab5} we compare the results obtained with the initial probabilities proposed by the authors and the results obtained with equal initial probabilities, that is 0.25 for all the states. 
+
+```{r}
+# Initial probabilities
+
+PI <- rep(0, N) # Initial state distribution
+PI[1] <- 0.7
+PI[2:N] <- 0.3 / (N - 1)
+```
+
+```{r,include=TRUE}
+# print initial probabilities
+df <- data.frame(states, round(PI, 2))
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab3} Initial probabilities",
+  col.names = c("State", "$\\pi_0$"), escape = FALSE
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+
+```{r}
+### Viterbi algorithm
+
+# Notation: correspondance with the description of Viterbi algorithm by
+# Cristianini et Hahn in "Introduction to Computational Genomics: A Case Studies Approach"
+
+# B is the function giving E the emission matrix
+# A is the transmission matrix T
+# delta corresponds to the V matrix, the sequence of loglikelihood of the most probable hidden sequence
+# Q is the pointer
+
+O <- reads
+
+N <- length(B)
+T1 <- length(O)
+delta <- matrix(ncol = T1, nrow = N)
+
+# first run
+b_o <- c()
+for (i in 1:N) {
+  b_o <- c(b_o, B[[i]](O[1]))
+}
+
+delta[, 1] <- log(PI) + log(b_o)
+
+Q <- matrix(ncol = T1, nrow = N)
+
+
+B <- vector("list", 4)
+
+for (i in 1:N) {
+  B[[i]] <- fun1(i)
+}
+
+for (t in 2:T1) {
+  b_o <- c()
+  for (i in 1:N) {
+    b_o <- c(b_o, B[[i]](O[t]))
+  }
+  nus <- delta[, t - 1] + A
+  delta[, t] <- apply(nus, 2, FUN = max) + log(b_o)
+  Q[, t] <- apply(nus, 2, FUN = which.max)
+}
+
+# traceback
+Q_opt <- c(which.max(delta[, T1]))
+
+for (t in T1:2) {
+  Q_opt <- c(Q[Q_opt[1], t], Q_opt)
+}
+```
+
+# Results
+
+## State frequency
+
+Table \ref{tab:tab4} shows the log-likelihood at the last TA site. The non-essential state is the most likely state in this position, therefore the trace-back in Viterbi algorithm starts from there to get the most probable path.
+
+```{r,include=TRUE}
+# print final site log likelihood
+df <- data.frame(states, delta[, T1])
+colnames(df) <- c("State", "Log-likelihood")
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab4} Final site log-likelihood"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+We obtained frequencies of states in the most probable path that are consistent with the ones reported by the DeJesus et Iorger in [1]. They are presented in Table \ref{tab:tab5}. The most probable state is non-essential, followed by essential. We obtain 16.5% of essential sites in the genome which matches previously reported estimate of 15% of essentiality in prokaryote genome [3]. The frequencies of growth-advantage and growth-defect states are small.
+
+```{r}
+# print frequency of states in most probable path
+df <- data.frame(round(100 * table(Q_opt) / length(Q_opt), 2))
+df[, 1] <- states
+colnames(df) <- c("State", "Total % of genome")
+rownames(df) <- NULL
+write.csv(df, paste0("state_freq_initprob", paste0(PI[1:2], collapse = "_"), ".csv"))
+df2 <- read_csv("state_freq_initprob0.25_0.25.csv", col_types = cols(X1 = col_skip()))
+```
+
+
+```{r,include=TRUE}
+kable(list(df, df2), "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab5} State frequency in TA sites with proposed (left) and equal (right) initial probabilities"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+
+## Essentiality of regions
+```{r}
+### Results processing
+
+
+data$state <- Q_opt
+data$state <- factor(data$state, levels = c(1, 2, 3, 4), labels = states)
+
+data <- data %>%
+  arrange(variableStep)
+
+data <- data %>%
+  mutate(
+    positive_count_flag = (count > 0),
+    positive_count = case_when(count > 1 ~ count)
+  )
+
+
+# Summary TA x state
+
+taxstate_summary <- data %>%
+  group_by(state) %>%
+  summarise(
+    number_TA = n(),
+    perc_TA = 100 * n() / nrow(data),
+    total_count = sum(count),
+    mean_count = mean(positive_count),
+    insertion_dens = sum(positive_count_flag) / n()
+  )
+```
+
+DeJesus et Iorger then analyse the mean read counts, mean insertion density and mean number of TA sites by state. The means are computed as averages across all regions belonging to a given state. The authors do not specify in [1] how they define a region but we assumed a region was a sequence of equal values of state. We then split the most probable path in stretches of equal state values and proceeded to compute similar statistics that are reported in Table \ref{tab:tab6}. 
+
+The results we obtained are very similar to the one obtained by the authors. There is nevertheless difference in the mean read counts for the growth advantage state, we obtained about 616 while DeJesus et Iorger obtained 701. However, this difference does not impair the consistency of the results and we can give them the same interpretation as the authors. The mean insertion density and the mean read count observed decreases with the level of essentiality as expected. The essential regions have a mean read counts close to 0 and very low insertion rate, while non-essential have a large mean read counts and high insertion rate. The growth-defect and growth-advantage state correctly rank as states with some insertions but in a small number for the former, and very high numbers of insertion and mean read counts for the latter.
+
+For DeJesus et Iorger, those results reflect the fact that the HMM is successfully separating regions with average read counts and insertions from those with counts significantly lower or significantly higher than average. Figure \ref{fig:fig1} shows how regions with the same degree of essentiality are clearly separated in function of mean read counts and insertion frequency.
+
+```{r}
+### Region boundaries
+
+data <- data %>%
+  mutate(region = rep(NA, nrow(data)))
+
+# runs of equal values of state
+rle_state <- rle(as.character(data$state))
+rle_state <- data.frame(length = rle_state$lengths, state = rle_state$values)
+
+data$region[1:rle_state$length[1]] <- paste0("Region", 1)
+
+k <- 2
+for (i in 2:nrow(rle_state)) {
+  start <- sum(rle_state$length[1:(i - 1)]) + 1
+  end <- start + rle_state$length[i] - 1
+  data$region[start:end] <- paste0("Region", k)
+  k <- k + 1
+}
+```
+
+```{r}
+# Summary by region
+region_summary <- data %>%
+  group_by(region) %>%
+  summarise(
+    region.state = levels(data$state)[which.max(table(state))],
+    number_TA = n(),
+    total_count = sum(count),
+    mean_count = max(mean(positive_count, na.rm = TRUE), 0, na.rm = TRUE),
+    insertion_dens = sum(positive_count_flag) / n()
+  )
+# Summary region x state
+regionxstate_summary <- region_summary %>%
+  group_by(region.state) %>%
+  summarise(
+    mean_nb_TA = round(mean(number_TA), 1),
+    mean_insertion_density = round(mean(insertion_dens), 3),
+    mean_reads_count = round(mean(mean_count), 2)
+  )
+```
+
+```{r,include=TRUE}
+# print statistics region:state
+
+df <- regionxstate_summary %>% arrange(mean_insertion_density)
+
+colnames(df) <- c("State", "Mean # TA sites", "Mean insertion density", "Mean read counts")
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab6} Statistics for state classification on regions"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+```{r include=TRUE,fig.cap="\\label{fig:fig1} Mean insertion density and read counts for regions", fig.pos = 'h!', fig.align="center"}
+ggplot(region_summary) + geom_point(aes(
+  x = insertion_dens,
+  y = mean_count,
+  col = region.state,
+  shape = region.state
+)) +
+  xlab("Insertion frequency") +
+  ylab("Mean read counts") +
+  labs(col = "State", shape = "State")
+```
+
+# Essentiality of individual genes
+
+## Essentiality as most frequent state
+
+```{r}
+#### Gene boundaries
+
+data <- data %>%
+  arrange(variableStep)
+
+## Identified genes
+gff3 <- readGFF(paste0(params$path, params$gff), version = 3)
+
+hash_gene <- as_tibble(gff3) %>%
+  filter(type == "gene") %>%
+  arrange(start)
+
+data <- data %>%
+  mutate(
+    gene.id = rep(NA, nrow(data)),
+    gene.name = rep(NA, nrow(data)),
+    gene.description = rep(NA, nrow(data))
+  )
+
+for (i in 1:nrow(hash_gene)) {
+  start <- as.numeric(hash_gene[i, "start"])
+  end <- as.numeric(hash_gene[i, "end"])
+  data <- data %>%
+    dplyr::filter(variableStep >= start & variableStep <= end) %>%
+    mutate(
+      gene.id = as.character(hash_gene[i, "gene_id"]),
+      gene.name = as.character(hash_gene[i, "Name"]),
+      gene.description = as.character(hash_gene[i, "description"])
+    ) %>%
+    rbind(data %>% dplyr::filter(!(variableStep >= start & variableStep <= end)))
+}
+
+genes_in_seq <- levels(factor(data$gene.id))
+genes_in_gff <- hash_gene$gene_id
+no_in_gff_notin_seq <- genes_in_gff[!genes_in_gff %in% genes_in_seq]
+```
+
+```{r}
+## Non-coding regions
+
+data <- data %>%
+  arrange(variableStep)
+
+# runs of equal values of gene.id
+rle_gene.id <- rle(is.na(data$gene.id))
+rle_gene.id <- data.frame(length = rle_gene.id$lengths, isna = rle_gene.id$values)
+
+even <- seq(2, nrow(rle_gene.id), 2)
+
+k <- 1
+for (i in even) {
+  start <- sum(rle_gene.id$length[1:(i - 1)]) + 1
+  end <- start + rle_gene.id$length[i] - 1
+  data$gene.id[start:end] <- paste0("non_protein_coding", k)
+  k <- k + 1
+}
+```
+
+```{r}
+# Summary genes
+gene_summary <- data %>%
+  group_by(gene.id) %>%
+  summarise(
+    gene.state = levels(data$state)[which.max(table(state))],
+    gene.name = max(gene.name),
+    gene.description = max(gene.description),
+    number_TA = n(),
+    total_count = sum(count),
+    mean_count = max(mean(positive_count, na.rm = TRUE), 0, na.rm = TRUE),
+    insertion_dens = sum(positive_count_flag) / n()
+  )
+# Summary genes x state
+genexstate_summary <- gene_summary %>%
+  filter(!grepl("non_protein", gene.id)) %>%
+  group_by(gene.state) %>%
+  summarise(
+    mean_nb_TA = round(mean(number_TA), 1),
+    mean_insertion_density = round(mean(insertion_dens), 3),
+    mean_reads_count = round(mean(mean_count), 2)
+  )
+```
+
+Following the methodology developed by the authors we map the sequencing data to identified genes in Mtb genome. We read gene positions from a GFF3 file obtained from EMBL database and match them with the TA sites from the sequencing dataset. We identify `r length(genes_in_seq)` in the original dataset. `r length(no_in_gff_notin_seq)` identified in H37Rv genome were not found in the sequencing data. Some TA sites are not recognised as belonging to any protein-coding gene. We identify such stretches of sites and label them as non-protein coding. We find `r k-1`
+of them.
+
+As a first approximation, we can assign genes the most frequent among its the TA sites. If we compute the same statistics as on regions, we obtain the Tables \ref{tab:tab7} and \ref{tab:tab8}. Those statistics were not reported by DeJesus et Iorger. We find a smaller proportion of essential genes than essential regions, however it is not too far from the 15% reference frequency. The non-essential state is still by far the most frequent degree of essentiality. We also see that the insertion density decreases with essentiality as expected. The mean number of read counts generally decreases with essentiality as well, except between growth-defect and essential states. This expected disordering might not be significant as only a small number of genes were assigned to growth-defect.
+
+```{r,include=TRUE}
+# print frequency of states in most probable path
+df <- data.frame(round(100 * table(gene_summary$gene.state) / nrow(gene_summary), 2))
+df[, 1] <- states
+colnames(df) <- c("State", "Total % of genome")
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab7} State frequency in genes"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+```{r,include=TRUE}
+# print statistics region:state
+
+df <- genexstate_summary %>% arrange(mean_insertion_density)
+
+colnames(df) <- c("State", "Mean # TA sites", "Mean insertion density", "Mean read counts")
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab8} Statistics for state classification on genes"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+```{r include=TRUE,fig.cap="\\label{fig:fig2} Mean insertion density and read counts for regions", fig.pos = 'h!', fig.align="center"}
+ggplot(gene_summary) + geom_point(aes(
+  x = insertion_dens,
+  y = mean_count,
+  col = gene.state,
+  shape = gene.state
+)) +
+  xlab("Insertion frequency") +
+  ylab("Mean read counts") +
+  labs(col = "State", shape = "State")
+```
+
+## Essentiality with extreme value distribution
+
+Individual genes can mix essential and non-essential regions. As a consequence, to refine the assignment of essentiality of genes, the authors suggest also assigning essentiality to genes that contain sub-sequences of essential TA sites which are statistically longer than expected. The authors rely on asymptotic results for the maximum of $n$ geometric variables to define a threshold for significance. As previously, the length of an essential region can be modelled with a geometric distribution with parameter $\theta$, the probability of insertion. From [4], the expectation and variance of such maximum is:
+
+$$E(max_L) = \mu(n,\theta) =  log_{1/\theta}(n(1-\theta)) + \frac{\gamma}{ln(1/\theta)} -1/2 + r_1(n) + \epsilon_1(n)$$
+$$Var(max_L)= \sigma^2(n,\theta) =  \frac{\pi^2}{6*ln(1/\theta)^2} + 1/12 + r_2(n) + \epsilon_2(n) $$
+where $\gamma \approx 0.577$ is Euler-Mascheroni constant, $r_1(n)$ and $r_2(n)$ are very small and $\epsilon_1$ and $\epsilon_2$ tend to 0. DeJesus et Iorger set $r_1$ to 0.000016 and $r_2$ to 0.00006, without giving any specific justification. In [5], Schilling shows that the distribution of the maximum converges to the Gumbel distribution called Extreme Value Distribution in [1]. The authors of [1] approximate high quantiles of the Gumbel distribution by:
+
+$$q(n,\theta) = \mu(n,\theta) + 3\sigma(n,\theta)$$
+
+```{r}
+### Gumbel/EVD Variance and Expected run functions
+
+# Variance
+VarR <- function(n, p) {
+  # VarR_n =  (pi^2)/(6*ln(1/p)^2) + 1/12 + r2(n) + E2(n) (Schilling, 1990)
+
+  r2 <- getR2(n)
+  E2 <- getE2(n)
+
+  A <- pi**2 / (6 * log(1 / p)**2)
+  V <- A + 1 / 12 + r2 + E2
+
+  return(V)
+}
+
+# Expectation
+ExpectedRuns <- function(n, p) {
+  # ER_n =  log(1/p)(nq) + gamma/ln(1/p) -1/2 + r1(n) + E1(n) (Schilling, 1990)
+
+  q <- 1 - p
+  gamma <- getGamma()
+  r1 <- getR1(n)
+  E1 <- getE1(n)
+
+
+  A <- log(n * q, base = 1.0 / p)
+  B <- gamma / log(1 / p)
+  ER <- A + B - 0.5 + r1 + E1
+
+  return(ER)
+}
+
+getGamma <- function() {
+  # Euler-Mascheroni constant ~ 0.577215664901
+  return(0.5772156649015328606)
+}
+
+getR1 <- function(n) {
+  # Small Correction term. Defaults to 0.000016
+  return(0.000016)
+}
+
+getR2 <- function(n) {
+  # Small Correction term. Defaults to 0.00006
+  return(0.00006)
+}
+
+getE1 <- function(n) {
+  # Small Correction term. Defaults to 0.01
+  return(0.01)
+}
+
+getE2 <- function(n) {
+  # Small Correction term. Defaults to 0.01
+  return(0.01)
+}
+
+
+theta <- sum(data$count > 0) / nrow(data)
+```
+
+The probability $\theta$ is estimated as the proportion of sites with non-zero count which gives a value of `r round(theta,3)`. We note that such estimation of the probability insertion is not consistent with the previous estimation performed to define the transition matrix, $p_{ins}$. The latter removed sequences of 0 count longer that 10 sites from the estimation sample. Therefore $\theta$ is smaller than $p_{ins}$. Finally if a gene of length $n$ contains more than $q(n,\theta)$ essential sites it is considered essential.
+
+```{r}
+### Reassignment of essentiality based on EVD
+
+# Summary genes x state
+gene_summary2 <- data %>%
+  group_by(gene.id) %>%
+  summarise(
+    gene.name = max(gene.name),
+    gene.description = max(gene.description),
+    number_TA = n(),
+    total_count = sum(count),
+    mean_count = max(mean(positive_count, na.rm = TRUE), 0, na.rm = TRUE),
+    insertion_dens = sum(positive_count_flag) / n(),
+    exp_max_len_es = ExpectedRuns(n(), 1 - theta),
+    var_len = VarR(n(), 1 - theta),
+    n_ES = table(state)["ES"],
+    n_GD = table(state)["GD"],
+    n_NE = table(state)["NE"],
+    n_GA = table(state)["GA"],
+    gene.state = levels(data$state)[which.max(table(state))]
+  )
+
+# Reassignment of state
+gene_summary3 <- gene_summary2 %>%
+  mutate(gene.state2 = case_when(
+    n_ES == number_TA ~ "ES",
+    n_ES >= exp_max_len_es + 3 * sqrt(var_len) ~ "ES",
+    TRUE ~ gene.state
+  ))
+
+
+# Summary genes x state
+genexstate_summary2 <- gene_summary3 %>%
+  filter(!grepl("non_protein", gene.id)) %>%
+  group_by(gene.state2) %>%
+  summarise(
+    mean_insertion_density = mean(insertion_dens),
+    mean_reads_count = mean(mean_count)
+  )
+
+# differences before and after assignment by EVD
+table(gene_summary3$gene.state, gene_summary3$gene.state2)
+```
+Such refined assignment causes the number of essential gene to rise from 738 to 770, with 4 growth-advantage and 28 non-essential genes becoming essential. The detail of cross-comparison of previous and refined assignments is presented in Table \ref{tab:tab9}.
+```{r,include=TRUE}
+# print differences before and after assignment by EVD
+df <- as.data.frame.matrix(table(gene_summary3$gene.state, gene_summary3$gene.state2))
+df <- df[, states]
+df <- data.frame(State = c("ES", "GA", "GD", "NE"), df)
+df <- df[c(1, 3, 4, 2), ]
+colnames(df) <- c("", states)
+rownames(df) <- NULL
+
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab9} Contingency table of essentiality assignment"
+) %>%
+  add_header_above(c(" " = 1, "Refined assignment" = 4)) %>%
+  pack_rows("Original", 1, 4) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+DeJesus et Iorger compare their results to those obtained by Sassetti et al. in [5] who used a completely different method, Transposon Site Hybridization (TraSH). We also cross-compare our results with the results from Sassetti et al in Table \ref{tab:tab10}. Sasetti et al. define a growth-defect class of regions and genes but DeJesus et Iorger deem that it is not comparable to the growth-defect definition they use in [1] and therefore do not compare their results for growth-defect genes. We, however, include the class in our comparison for reference. We see the assignments are matching for a large majority of genes. They are not matching for the growth-defect class of genes. Nevertheless our results are in line with DeJesus et Ioger's as they mention in [1] that the majority of growth-defect genes identified by Sasetti et al. were classified as non-essential by their HMM.
+```{r}
+# Comparison to TraSH
+non_essential_traSH <- read_excel(paste0(params$path, "mmi_3425_sm_tables3.xls"), skip = 1)
+ne_genes_trash <- non_essential_traSH$`Rv designation`
+
+trash_genes <- data.frame(gene.id = ne_genes_trash, gene.state.trash = "NE")
+
+ne_genes_hmm <- gene_summary3 %>%
+  filter(!grepl("non_protein", gene.id)) %>%
+  filter(gene.state2 == "NE") %>%
+  select(gene.id)
+ne_genes_hmm <- ne_genes_hmm$gene.id
+length(ne_genes_trash %in% ne_genes_hmm)
+
+growth_defect_traSH <- read_excel(paste0(params$path, "mmi_3425_sm_tables2.xls"), skip = 1)
+growth_defect_trash <- growth_defect_traSH$`Rv designation`
+trash_genes <- rbind(trash_genes, data.frame(gene.id = growth_defect_trash, gene.state.trash = "GD"))
+
+essential_traSH <- read_excel(paste0(params$path, "mmi_3425_sm_tables1.xls"), skip = 1)
+essential_trash <- essential_traSH$`Rv designation`
+trash_genes <- rbind(trash_genes, data.frame(gene.id = essential_trash, gene.state.trash = "ES"))
+
+gene_summary4 <- gene_summary3 %>% full_join(trash_genes, by = "gene.id")
+
+coding_genes <- gene_summary4 %>%
+  filter(!grepl("non_protein", gene.id))
+
+table(gene_summary4$gene.state.trash, gene_summary4$gene.state2)
+```
+
+
+```{r,include=TRUE}
+# pint differences with TraSH
+df <- as.data.frame.matrix(table(gene_summary4$gene.state.trash, gene_summary4$gene.state2))
+df <- df[, states]
+df <- data.frame(State = c("NE", "GD", "ES"), df)
+df <- df[c(3, 2, 1), ]
+colnames(df) <- c("", states)
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab10} Contingency table of essentiality assignment with TraSH"
+) %>%
+  add_header_above(c(" " = 1, "HMM" = 4)) %>%
+  pack_rows("TraSH", 1, 3) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+## Notable growth-defect and growth-advantage genes
+
+Finally, DeJesus et Iorger identify a list of notable growth-defect and growth-advantage genes. For those genes the labels "growth-defect" or "growth-advantage" have a biological explanation. Those genes are listed in Tables \ref{tab:tab11} and \ref{tab:tab12}. We find that most of them have a corresponding label in our results. The exceptions are genes which state we assigned on an individual basis while they are grouped in the authors results.
+
+```{r,include=TRUE}
+# Notable growth defect and growth advantage
+notable_gd <- c("Rv0015c", "Rv0016c", "Rv0467", "Rv2379c", "Rv2380c", "Rv2381c", "Rv2382c", "Rv3841", "Rv0126", "Rv1097c", "Rv1098c", "Rv1099c")
+
+df <- gene_summary3 %>%
+  filter(gene.id %in% notable_gd) %>%
+  select(gene.id, gene.state2, gene.name, insertion_dens, number_TA, mean_count)
+colnames(df) <- c("Orf Ids", "State", "Included genes", "Insertion density", "Length", "Average reads")
+df[, 4] <- round(df[, 4], 3)
+df[, 6] <- round(df[, 6], 1)
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab11} Notable Growth-Defect genes"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+notable_ga <- c("Rv3295", "Rv3296", "Rv2939", "Rv2940c", "Rv2941", "Rv2411c", "Rv0483", "Rv2930", "Rv2931", "Rv2932", "Rv2933", "Rv2934", "Rv2935", "Rv1843c", "Rv1844c", "Rv0554", "Rv0479c", "Rv0480c", "Rv0481c")
+
+df <- gene_summary3 %>%
+  filter(gene.id %in% notable_ga) %>%
+  select(gene.id, gene.state2, gene.name, insertion_dens, number_TA, mean_count)
+colnames(df) <- c("Orf Ids", "State", "Included genes", "Insertion density", "Length", "Average reads")
+df[, 4] <- round(df[, 4], 3)
+df[, 6] <- round(df[, 6], 1)
+rownames(df) <- NULL
+kable(df, "latex",
+  booktabs = T,
+  caption = "\\label{tab:tab12} Notable Growth-Advantage genes"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+```
+
+\pagebreak
+\pagebreak
+
+# References 
+
+[1] DeJesus and Ioerger: A Hidden Markov Model for identifying essential and growth-defect regions in bacterial genomes from transposon insertion sequencing data. BMC Bioinformatics 2013 14:303.
+
+[2] Griffin JE, Gawronski JD, DeJesus MA, Ioerger TR, Akerley BJ, et al. (2011) High-Resolution Phenotypic Profiling Defines Genes Essential for Mycobacterial Growth and Cholesterol Catabolism. PLoS Pathog 7(9): e1002251. doi:10.1371/journal.ppat.1002251
+
+[3] Gerdes SY, Scholle MD, Campbell JW, Balazsi G, Ravasz E, Daugherty MD, Somera AL, Kyrpides NC, Anderson I, Gelfand MS, Bhattacharya A, Kapatral V, D’Souza M, Baev MV, Grechkin Y, Mseeh F, Fonstein MY, Overbeek R, Barabasi AL, Oltvai ZN, Osterman AL: Experimental determination and system level analysis of essential genes in Escherichia coli MG1655. J Bacteriol 2003, 185(19):5673–5684.
+
+[4] M. F. Schilling, The longest run of heads, The College Mathematics Journal 21(3) (1990) 196–207 http://dx.doi.org/10.2307/2686886.
+
+[5] Sassetti CM, Boyd DH, Rubin EJ: Genes required for mycobacterial growth defined by high density mutagenesis. MolMicrobiol 2003, 48:77–84. [http://dx.doi.org/10.1046/j.1365-2958.2003.03425.x]
